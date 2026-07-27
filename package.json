@@ -1,0 +1,31 @@
+{
+  "name": "expandEbsFilesystem",
+  "version": "1.0.0",
+  "description": "Lambda function to resize an EBS volume filesystem",
+  "license": "ISC",
+  "author": "Mike Garthwaite",
+  "type": "module",
+  "main": "handler.ts",
+  "scripts": {
+    "test": "test",
+    "lint": "eslint src",
+    "codelint": "npm run lint src/ && tsc --noEmit",
+    "build": "node esbuild.mjs",
+    "zip": "cd dist && zip -r function.zip .",
+    "deploy": "npm run lint && npm run build && npm run zip && bash scripts/deploy.sh"
+  },
+  "dependencies": {
+    "@aws-sdk/client-ec2": "^3.1087.0",
+    "@aws-sdk/client-ssm": "^3.1095.0",
+    "dotenv": "^17.4.2"
+  },
+  "devDependencies": {
+    "@types/aws-lambda": "^8.10.161",
+    "@typescript-eslint/eslint-plugin": "^8.60.1",
+    "@typescript-eslint/parser": "^8.60.1",
+    "esbuild": "^0.25.12",
+    "eslint": "^9.39.4",
+    "typescript": "^5.9.3",
+    "typescript-eslint": "^8.60.1"
+  }
+}
