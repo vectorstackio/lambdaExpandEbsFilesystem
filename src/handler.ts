@@ -9,31 +9,44 @@ type Event = {
 const client = new SSMClient({})
 
 export async function handler(event: Event) {
-  console.log('Received event:', JSON.stringify(event))
-
-  const body = JSON.parse(event.body)
-
-  console.log('Parsed body:', JSON.stringify(body))
+  // Never log request data or parser errors: they can contain credentials.
+  let body
+  try {
+    body = JSON.parse(event.body)
+    if (body === null || typeof body !== 'object' || Array.isArray(body)) {
+      throw new Error('Invalid body')
+    }
+  } catch {
+    console.error('Filesystem expansion request rejected: invalid JSON object')
+    return {
+      statusCode: 400,
+      body: JSON.stringify({ error: 'Request body must be a JSON object' })
+    }
+  }
 
   const { instanceId, volumeId } = body
 
   //
   // Validate instance ID
   //
-  if (!instanceId) {
+  if (typeof instanceId !== 'string' ||
+      ![10, 19].includes(instanceId.length) ||
+      !/^i-(?:[0-9a-f]{8}|[0-9a-f]{17})$/.test(instanceId)) {
     return {
       statusCode: 400,
-      body: JSON.stringify({error: 'instanceId is required'})
+      body: JSON.stringify({error: 'instanceId must be a canonical EC2 instance ID'})
     }
   }
 
   //
   // Validate volume ID
   //
-  if (!volumeId) {
+  if (typeof volumeId !== 'string' ||
+      ![12, 21].includes(volumeId.length) ||
+      !/^vol-(?:[0-9a-f]{8}|[0-9a-f]{17})$/.test(volumeId)) {
     return {
       statusCode: 400,
-      body: JSON.stringify({error: 'volumeId is required'})
+      body: JSON.stringify({error: 'volumeId must be a canonical EBS volume ID'})
     }
   }
 
@@ -49,7 +62,7 @@ export async function handler(event: Event) {
         // Remove the hyphen from the EBS volume ID
         // because NVMe serial numbers omit it.
         //
-        `VOLUME_ID=${volumeId.replace('vol-', 'vol')}`,
+        `VOLUME_ID='${volumeId.replace('vol-', 'vol')}'`,
 
         //
         // Find the NVMe device associated
@@ -62,7 +75,6 @@ export async function handler(event: Event) {
         //
         'if [ -z "$DEVICE" ]; then',
         '  echo "ERROR: Could not find device for EBS volume"',
-        '  echo "Looking for serial: $VOLUME_ID"',
         '  echo "Available devices:"',
         '  lsblk -ndo NAME,SERIAL',
         '  exit 1',
@@ -73,7 +85,6 @@ export async function handler(event: Event) {
         //
         'DEVICE="/dev/$DEVICE"',
 
-        'echo "EBS volume: ' + volumeId + '"',
 
         'echo "NVMe device: $DEVICE"',
 
@@ -146,13 +157,7 @@ export async function handler(event: Event) {
   })
 
   try {
-    console.log(
-      'Sending SSM command for:',
-      JSON.stringify({
-        instanceId,
-        volumeId
-      })
-    )
+    console.log('Sending filesystem expansion SSM command')
 
     const result = await client.send(command)
 
@@ -166,8 +171,8 @@ export async function handler(event: Event) {
       })
     }
 
-  } catch (err) {
-    console.error('Failed to send SSM command', err)
+  } catch {
+    console.error('Failed to send SSM command')
 
     return {
       statusCode: 500,

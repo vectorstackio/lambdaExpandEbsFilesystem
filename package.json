@@ -7,7 +7,7 @@
   "type": "module",
   "main": "handler.ts",
   "scripts": {
-    "test": "test",
+    "test": "node --test tests/*.test.cjs",
     "lint": "eslint src",
     "codelint": "npm run lint src/ && tsc --noEmit",
     "build": "node esbuild.mjs",
