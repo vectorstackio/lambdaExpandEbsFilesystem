@@ -1,43 +1,39 @@
-const { test } = require('node:test')
-const assert = require('node:assert/strict')
-const fs = require('node:fs')
-const path = require('node:path')
-const vm = require('node:vm')
-const ts = require('typescript')
-const operation = path.basename(path.resolve(__dirname, '..'))
-const resize = operation === 'resizeEBSVolume'
-const source = fs.readFileSync(path.resolve(__dirname, '../src/handler.ts'), 'utf8')
-const compiled = ts.transpileModule(source, {
-  compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022 }
-}).outputText
+import { test, vi, afterEach } from 'vitest'
+import assert from 'node:assert/strict'
+import fs from 'node:fs'
+import ts from 'typescript'
+
+const { sendMock } = vi.hoisted(() => ({ sendMock: vi.fn() }))
+vi.mock('@aws-sdk/client-ssm', () => ({
+  SSMClient: class { send(command) { return sendMock(command) } },
+  SendCommandCommand: class { constructor(input) { this.input = input } }
+}))
+
+import { handler } from '../src/handler.ts'
+
+const source = fs.readFileSync(new URL('../src/handler.ts', import.meta.url), 'utf8')
 const marker = 'SENSITIVE_TEST_VALUE_DO_NOT_LOG'
-const allowed = new Set(resize ? [
-  'Resize request rejected: invalid JSON object',
-  'Validation failed: volumeId is missing', 'Validation failed: size is missing',
-  'Validation failed: invalid size', 'Calling ModifyVolume',
-  'ModifyVolume succeeded', 'ModifyVolume failed'
-] : [
+const allowed = new Set([
   'Filesystem expansion request rejected: invalid JSON object',
   'Sending filesystem expansion SSM command', 'Failed to send SSM command'
 ])
+
 function fixture(send) {
   const logs = []
   const requests = []
-  const logger = Object.fromEntries(['log', 'error', 'warn', 'info', 'debug', 'trace', 'dir', 'table'].map(level => [level, (...args) => logs.push(args)]))
-  class Client {
-    async send(command) { requests.push(command.input); return send(command.input) }
+  for (const level of ['log', 'error', 'warn', 'info', 'debug', 'trace', 'dir', 'table']) {
+    vi.spyOn(console, level).mockImplementation((...args) => logs.push(args))
   }
-  class Command { constructor(input) { this.input = input } }
-  const module = { exports: {} }
-  vm.runInNewContext(compiled, {
-    module, exports: module.exports, console: logger,
-    require(name) {
-      assert.ok(['@aws-sdk/client-ec2', '@aws-sdk/client-ssm'].includes(name))
-      return { EC2Client: Client, SSMClient: Client, ModifyVolumeCommand: Command, SendCommandCommand: Command }
-    }
+  sendMock.mockImplementation(async command => {
+    requests.push(command.input)
+    return send(command.input)
   })
-  return { handler: module.exports.handler, logs, requests }
+  return { handler, logs, requests }
 }
+afterEach(() => {
+  vi.restoreAllMocks()
+  sendMock.mockReset()
+})
 function checkLogs(logs) {
   for (const args of logs) {
     assert.equal(args.length, 1)
@@ -57,19 +53,16 @@ function event(body) {
 const valid = { volumeId: 'vol-0123456789abcdef0', instanceId: 'i-0123456789abcdef0', size: 32, credentials: marker, nested: { token: marker } }
 
 test('success logs only allowlisted messages; request and service data never reach logs', async () => {
-  const result = resize ? { VolumeModification: { VolumeId: 'vol-0123456789abcdef0', OriginalSize: 16, TargetSize: 32, ModificationState: 'modifying', ignored: marker } } : { Command: { CommandId: 'test-command', Status: 'Pending', ignored: marker } }
+  const result = { Command: { CommandId: 'test-command', Status: 'Pending', ignored: marker } }
   const f = fixture(async () => result)
   const response = await f.handler(event(valid))
   assert.equal(response.statusCode, 200)
   assert.equal(f.requests.length, 1)
-  if (resize) assert.deepEqual(JSON.parse(response.body), { volumeId: valid.volumeId, originalSize: 16, targetSize: 32, state: 'modifying' })
-  else {
-    assert.deepEqual(JSON.parse(response.body), { commandId: 'test-command', instanceId: valid.instanceId, volumeId: valid.volumeId, status: 'Pending' })
-    assert.equal(f.requests[0].DocumentName, 'AWS-RunShellScript')
-    assert.equal(f.requests[0].InstanceIds[0], valid.instanceId)
-    const outputs = f.requests[0].Parameters.commands.filter(line => /^\s*echo\b/.test(line))
-    assert.ok(outputs.every(line => !line.includes(valid.volumeId) && !line.includes('$VOLUME_ID')))
-  }
+  assert.deepEqual(JSON.parse(response.body), { commandId: 'test-command', instanceId: valid.instanceId, volumeId: valid.volumeId, status: 'Pending' })
+  assert.equal(f.requests[0].DocumentName, 'AWS-RunShellScript')
+  assert.equal(f.requests[0].InstanceIds[0], valid.instanceId)
+  const outputs = f.requests[0].Parameters.commands.filter(line => /^\s*echo\b/.test(line))
+  assert.ok(outputs.every(line => !line.includes(valid.volumeId) && !line.includes('$VOLUME_ID')))
   assert.ok(f.logs.length > 0)
   checkLogs(f.logs)
 })
@@ -96,11 +89,7 @@ test('malformed JSON cannot leak through parser exceptions or reach AWS', async 
 })
 
 test('validation paths never log arbitrary request fields', async () => {
-  const cases = resize ? [
-    { size: 32, secret: marker }, { volumeId: marker },
-    { volumeId: marker, size: marker }, { volumeId: marker, size: { secret: marker } },
-    { volumeId: marker, size: -1 }
-  ] : [{ volumeId: marker, secret: marker }, { instanceId: marker, secret: marker }]
+  const cases = [{ volumeId: marker, secret: marker }, { instanceId: marker, secret: marker }]
   for (const body of cases) {
     const f = fixture(async () => { throw new Error('Unexpected AWS call') })
     const response = await f.handler(event(body))
@@ -152,4 +141,66 @@ test('legacy and current canonical IDs retain response shape and only a quoted h
     assert.deepEqual(JSON.parse(response.body), { ...input, commandId: 'command', status: 'Pending' })
     checkLogs(f.logs)
   }
+})
+
+test('missing and non-object bodies return the documented error without calling SSM', async () => {
+  for (const body of [undefined, '', 'null', '[]', '42', 'true', '"text"', '{']) {
+    const f = fixture(() => { throw new Error('Unexpected AWS call') })
+    const response = await f.handler({ body })
+    assert.equal(response.statusCode, 400)
+    assert.deepEqual(JSON.parse(response.body), { error: 'Request body must be a JSON object' })
+    assert.equal(f.requests.length, 0)
+  }
+})
+
+test('invalid identifiers produce specific errors and instance validation takes precedence', async () => {
+  for (const [body, error] of [
+    [{}, 'instanceId must be a canonical EC2 instance ID'],
+    [{ instanceId: valid.instanceId }, 'volumeId must be a canonical EBS volume ID'],
+    [{ instanceId: 'i-0123456g', volumeId: valid.volumeId }, 'instanceId must be a canonical EC2 instance ID'],
+    [{ instanceId: valid.instanceId, volumeId: 'vol-0123456g' }, 'volumeId must be a canonical EBS volume ID']
+  ]) {
+    const f = fixture(() => { throw new Error('Unexpected AWS call') })
+    const response = await f.handler(event(body))
+    assert.equal(response.statusCode, 400)
+    assert.deepEqual(JSON.parse(response.body), { error })
+    assert.equal(f.requests.length, 0)
+  }
+})
+
+test('partial SSM responses omit unavailable command fields', async () => {
+  for (const result of [{}, { Command: {} }, { Command: { CommandId: 'cmd' } }, { Command: { Status: 'Pending' } }]) {
+    const f = fixture(async () => result)
+    const response = await f.handler(event(valid))
+    assert.equal(response.statusCode, 200)
+    assert.deepEqual(JSON.parse(response.body), {
+      ...('CommandId' in (result.Command || {}) ? { commandId: result.Command.CommandId } : {}),
+      instanceId: valid.instanceId,
+      volumeId: valid.volumeId,
+      ...('Status' in (result.Command || {}) ? { status: result.Command.Status } : {})
+    })
+  }
+})
+
+test('SSM command targets the instance and contains the filesystem expansion steps', async () => {
+  const f = fixture(async () => ({ Command: { CommandId: 'cmd', Status: 'Pending' } }))
+  await f.handler(event(valid))
+  assert.equal(f.requests.length, 1)
+  const input = f.requests[0]
+  assert.equal(input.DocumentName, 'AWS-RunShellScript')
+  assert.equal(input.InstanceIds.length, 1)
+  assert.equal(input.InstanceIds[0], valid.instanceId)
+  const script = input.Parameters.commands.join('\n')
+  for (const step of ['lsblk -ndo NAME,SERIAL', 'if [ -z "$DEVICE" ]', 'growpart "$DEVICE" "$PARTITION_NUMBER"', 'resize2fs "$PARTITION"', 'findmnt -n -o TARGET "$PARTITION"', 'xfs_growfs "$MOUNTPOINT"', 'Unsupported filesystem', 'df -Th']) {
+    assert.ok(script.includes(step), `Missing command step: ${step}`)
+  }
+})
+
+test('SSM rejection returns a generic error and no sensitive service details', async () => {
+  const f = fixture(async () => { throw new Error(marker) })
+  const response = await f.handler(event(valid))
+  assert.equal(response.statusCode, 500)
+  assert.deepEqual(JSON.parse(response.body), { error: 'Internal Server Error in expandEbsFilesystemLambda' })
+  assert.equal(f.requests.length, 1)
+  checkLogs(f.logs)
 })
